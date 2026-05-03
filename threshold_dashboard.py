@@ -1,12 +1,14 @@
 # ============================================================
 # INTERACTIVE GOVERNANCE THRESHOLD DASHBOARD
-# Fraud Detection Threshold Simulator
+# Fraud Detection Threshold Simulator with Auto-Play + Explanation View
 # ============================================================
 # Run with:
 # streamlit run threshold_dashboard.py
 #
-# Required packages:
+# Install:
 # pip install streamlit pandas numpy scikit-learn matplotlib
+# Optional SHAP:
+# pip install shap
 # ============================================================
 
 import time
@@ -40,19 +42,12 @@ st.set_page_config(
 )
 
 st.title("⚖️ Governance Threshold Simulator for Fraud Detection")
+
 st.markdown(
     """
-This dashboard shows how changing the **decision threshold** affects fraud detection governance metrics:
+This interactive dashboard demonstrates how a fraud detection model behaves when the **decision threshold** changes.
 
-- Alert volume
-- Recall
-- Precision
-- F1-score
-- AUC-PR
-- ROC-AUC
-- Approximate explanation latency
-
-The model stays the same. Only the threshold changes.
+The model remains unchanged. The threshold governs how model scores become operational decisions.
 """
 )
 
@@ -80,13 +75,26 @@ test_size = st.sidebar.slider(
     step=0.05,
 )
 
-threshold = st.sidebar.slider(
-    "Decision threshold",
+st.sidebar.markdown("---")
+st.sidebar.header("Threshold Control")
+
+auto_play = st.sidebar.checkbox("Auto-play threshold movement", value=False)
+
+manual_threshold = st.sidebar.slider(
+    "Manual decision threshold",
     min_value=0.0000,
     max_value=1.0000,
     value=0.0500,
     step=0.0005,
     format="%.4f",
+)
+
+auto_speed = st.sidebar.slider(
+    "Auto-play speed",
+    min_value=0.01,
+    max_value=0.20,
+    value=0.05,
+    step=0.01,
 )
 
 latency_per_explanation_ms = st.sidebar.slider(
@@ -98,7 +106,8 @@ latency_per_explanation_ms = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Governance Modes")
+st.sidebar.header("Governance Constraints")
+
 recall_target = st.sidebar.slider(
     "Recall target",
     min_value=0.50,
@@ -117,7 +126,7 @@ alert_rate_target = st.sidebar.slider(
 )
 
 # ============================================================
-# DATA LOADING
+# DATA FUNCTIONS
 # ============================================================
 
 @st.cache_data(show_spinner=True)
@@ -256,6 +265,39 @@ def make_tradeoff_df(y_true, y_scores, latency_per_explanation_ms):
     return pd.DataFrame(rows)
 
 # ============================================================
+# EXPLANATION FUNCTION
+# ============================================================
+
+def generate_simple_explanation(model, X_test, transaction_position):
+    """
+    Lightweight explanation for presentation.
+    For Logistic Regression, this approximates feature contribution as:
+    scaled_feature_value × coefficient.
+    """
+
+    preprocessor = model[:-1]
+    classifier = model.named_steps["model"]
+
+    X_row = X_test.iloc[[transaction_position]]
+    transformed = preprocessor.transform(X_row)
+
+    coefs = classifier.coef_[0]
+    contributions = transformed[0] * coefs
+
+    explanation_df = pd.DataFrame(
+        {
+            "feature": X_test.columns,
+            "contribution": contributions,
+            "absolute_contribution": np.abs(contributions),
+            "original_value": X_row.iloc[0].values,
+        }
+    )
+
+    explanation_df = explanation_df.sort_values("absolute_contribution", ascending=False).head(10)
+
+    return explanation_df[["feature", "original_value", "contribution"]]
+
+# ============================================================
 # MAIN APP
 # ============================================================
 
@@ -269,7 +311,6 @@ except Exception as e:
     st.error(f"Data loading error: {e}")
     st.stop()
 
-# Dataset overview
 fraud_count = int(df["Class"].sum())
 total_count = int(len(df))
 fraud_rate = float(df["Class"].mean())
@@ -285,6 +326,13 @@ c4.metric("Missing values", f"{int(df.isnull().sum().sum()):,}")
 with st.spinner("Training lightweight model and scoring transactions..."):
     model, X_test, y_test, y_scores, training_time, scoring_time = train_model(df, test_size)
 
+# Auto-play threshold logic
+if auto_play:
+    t = (time.time() * auto_speed) % 1.0
+    threshold = float(t)
+else:
+    threshold = manual_threshold
+
 st.subheader("2. Model Status")
 
 m1, m2, m3 = st.columns(3)
@@ -292,10 +340,10 @@ m1.metric("Training time", f"{training_time:.3f} sec")
 m2.metric("Scoring time", f"{scoring_time:.4f} sec")
 m3.metric("Test transactions", f"{len(y_test):,}")
 
-# Current threshold metrics
 metrics = compute_metrics(y_test, y_scores, threshold, latency_per_explanation_ms)
 
 st.subheader("3. Live Threshold Impact")
+st.caption(f"Current threshold: {threshold:.4f}")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Recall", f"{metrics['recall']:.3f}")
@@ -319,7 +367,7 @@ cm_df = pd.DataFrame(
 )
 st.dataframe(cm_df, use_container_width=True)
 
-# Governance modes
+# Governance operating modes
 st.subheader("4. Governance Operating Modes")
 
 recall_threshold = threshold_for_recall(y_test, y_scores, recall_target)
@@ -337,6 +385,7 @@ with col_a:
     st.metric("Recall", f"{recall_metrics['recall']:.3f}")
     st.metric("Alert volume", f"{recall_metrics['alert_volume']:,}")
     st.metric("False negatives", f"{recall_metrics['false_negatives']:,}")
+    st.metric("Estimated explanation time", f"{recall_metrics['total_explanation_latency_sec']:.2f} sec")
 
 with col_b:
     st.markdown("### Alert-Volume Mode")
@@ -345,6 +394,7 @@ with col_b:
     st.metric("Recall", f"{alert_metrics['recall']:.3f}")
     st.metric("Alert volume", f"{alert_metrics['alert_volume']:,}")
     st.metric("False negatives", f"{alert_metrics['false_negatives']:,}")
+    st.metric("Estimated explanation time", f"{alert_metrics['total_explanation_latency_sec']:.2f} sec")
 
 # Trade-off curves
 st.subheader("5. Trade-Off Curves")
@@ -380,7 +430,7 @@ ax3.legend()
 ax3.grid(True)
 st.pyplot(fig3)
 
-# Explanation latency section
+# Explanation latency governance
 st.subheader("6. Explanation Latency Governance")
 
 st.markdown(
@@ -389,12 +439,48 @@ Assumed latency per explanation: **{latency_per_explanation_ms} ms**
 Current selected threshold produces **{metrics['alert_volume']:,} alerts**.  
 Estimated total explanation time: **{metrics['total_explanation_latency_sec']:.2f} seconds**.
 
-This demonstrates that explanation latency is not only a model-level issue. It also depends on alert volume.
+This shows that explanation latency depends not only on the explainer, but also on alert volume.
 """
 )
 
+# Transaction explanation view
+st.subheader("7. Transaction-Level Explanation View")
+
+if len(y_scores) > 0:
+    ranked_indices = np.argsort(y_scores)[::-1]
+    selected_rank = st.slider(
+        "Select transaction by risk rank",
+        min_value=1,
+        max_value=min(100, len(ranked_indices)),
+        value=1,
+        step=1,
+    )
+
+    tx_pos = int(ranked_indices[selected_rank - 1])
+    tx_score = float(y_scores[tx_pos])
+    tx_prediction = int(tx_score >= threshold)
+
+    st.markdown(
+        f"""
+**Selected transaction risk rank:** {selected_rank}  
+**Fraud probability:** {tx_score:.4f}  
+**Current decision:** {'Fraud Alert' if tx_prediction == 1 else 'Not Alerted'}
+"""
+    )
+
+    explanation_df = generate_simple_explanation(model, X_test, tx_pos)
+    st.dataframe(explanation_df, use_container_width=True)
+
+    fig4, ax4 = plt.subplots(figsize=(8, 4))
+    plot_df = explanation_df.sort_values("contribution")
+    ax4.barh(plot_df["feature"], plot_df["contribution"])
+    ax4.set_xlabel("Approximate contribution")
+    ax4.set_title("Top Feature Contributions for Selected Transaction")
+    ax4.grid(True)
+    st.pyplot(fig4)
+
 # Governance interpretation
-st.subheader("7. Governance Interpretation")
+st.subheader("8. Governance Interpretation")
 
 if metrics["recall"] >= recall_target and metrics["alert_rate"] <= alert_rate_target:
     st.success("This threshold satisfies both recall and alert-volume constraints.")
@@ -412,8 +498,8 @@ st.markdown(
 """
 )
 
-# Download outputs
-st.subheader("8. Export Results")
+# Export outputs
+st.subheader("9. Export Results")
 
 export_df = tradeoff_df.copy()
 export_df["selected_manual_threshold"] = threshold
