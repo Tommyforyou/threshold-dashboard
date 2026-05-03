@@ -1,17 +1,19 @@
 # ============================================================
-# INTERACTIVE GOVERNANCE THRESHOLD DASHBOARD
-# Fraud Detection Threshold Simulator with Auto-Play + Explanation View
+# ENHANCED GOVERNANCE THRESHOLD DASHBOARD — FULL PhD DEFENCE VERSION
 # ============================================================
-# Run with:
-# streamlit run threshold_dashboard.py
+# Run:
+#   streamlit run threshold_dashboard.py
 #
 # Install:
-# pip install streamlit pandas numpy scikit-learn matplotlib
-# Optional SHAP:
-# pip install shap
+#   pip install streamlit pandas numpy scikit-learn matplotlib
+#
+# Optional for PDF export:
+#   pip install reportlab
 # ============================================================
 
+import io
 import time
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,6 +24,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     average_precision_score,
     roc_auc_score,
@@ -36,94 +39,66 @@ from sklearn.metrics import (
 # ============================================================
 
 st.set_page_config(
-    page_title="Governance Threshold Simulator",
+    page_title="SIDS Governance Feasibility Dashboard",
     page_icon="⚖️",
     layout="wide",
 )
 
-st.title("⚖️ Governance Threshold Simulator for Fraud Detection")
+st.title("⚖️ SIDS Governance Feasibility Dashboard")
 
 st.markdown(
     """
-This interactive dashboard demonstrates how a fraud detection model behaves when the **decision threshold** changes.
+This dashboard demonstrates how fraud-detection thresholds affect **risk, workload, latency, explainability, and deployment feasibility**.
 
-The model remains unchanged. The threshold governs how model scores become operational decisions.
+**Core principle:** the model produces scores, but governance determines how those scores become operational decisions.
 """
 )
 
 # ============================================================
-# SIDEBAR SETTINGS
+# SIDEBAR
 # ============================================================
 
-st.sidebar.header("Simulation Settings")
-
+st.sidebar.header("1. Data")
 uploaded_file = st.sidebar.file_uploader("Upload creditcard.csv", type=["csv"])
+max_rows = st.sidebar.slider("Maximum rows", 5_000, 100_000, 30_000, 5_000)
+test_size = st.sidebar.slider("Test size", 0.10, 0.40, 0.20, 0.05)
 
-max_rows = st.sidebar.slider(
-    "Maximum rows to use",
-    min_value=5_000,
-    max_value=100_000,
-    value=30_000,
-    step=5_000,
-)
-
-test_size = st.sidebar.slider(
-    "Test size",
-    min_value=0.10,
-    max_value=0.40,
-    value=0.20,
-    step=0.05,
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Threshold Control")
-
+st.sidebar.header("2. Threshold Control")
+threshold = st.sidebar.slider("Manual threshold", 0.0, 1.0, 0.05, 0.001)
 auto_play = st.sidebar.checkbox("Auto-play threshold movement", value=False)
+auto_speed = st.sidebar.slider("Auto-play speed", 0.01, 0.20, 0.05, 0.01)
 
-manual_threshold = st.sidebar.slider(
-    "Manual decision threshold",
-    min_value=0.0000,
-    max_value=1.0000,
-    value=0.0500,
-    step=0.0005,
-    format="%.4f",
+st.sidebar.header("3. Governance Constraints")
+recall_target = st.sidebar.slider("Recall target", 0.50, 1.00, 0.90, 0.01)
+alert_rate_target = st.sidebar.slider("Alert-rate target", 0.001, 0.100, 0.010, 0.001, format="%.3f")
+latency_target_sec = st.sidebar.slider("Total explanation latency target (sec)", 1.0, 120.0, 30.0, 1.0)
+latency_per_alert_ms = st.sidebar.slider("Latency per alert explanation (ms)", 1, 2000, 250, 10)
+review_time_per_alert_min = st.sidebar.slider("Analyst review time per alert (min)", 1, 15, 3, 1)
+
+st.sidebar.header("4. Scenario Presets")
+scenario = st.sidebar.selectbox(
+    "Scenario",
+    [
+        "Manual",
+        "High-risk bank mode",
+        "Normal operations mode",
+        "Limited analyst capacity mode",
+        "Regulatory audit mode",
+    ],
 )
 
-auto_speed = st.sidebar.slider(
-    "Auto-play speed",
-    min_value=0.01,
-    max_value=0.20,
-    value=0.05,
-    step=0.01,
-)
-
-latency_per_explanation_ms = st.sidebar.slider(
-    "Assumed explanation latency per alert (ms)",
-    min_value=1,
-    max_value=2000,
-    value=250,
-    step=10,
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Governance Constraints")
-
-recall_target = st.sidebar.slider(
-    "Recall target",
-    min_value=0.50,
-    max_value=1.00,
-    value=0.90,
-    step=0.01,
-)
-
-alert_rate_target = st.sidebar.slider(
-    "Alert-rate target",
-    min_value=0.001,
-    max_value=0.100,
-    value=0.010,
-    step=0.001,
-    format="%.3f",
-)
+if scenario == "High-risk bank mode":
+    recall_target = 0.95
+    alert_rate_target = 0.03
+elif scenario == "Normal operations mode":
+    recall_target = 0.90
+    alert_rate_target = 0.02
+elif scenario == "Limited analyst capacity mode":
+    recall_target = 0.85
+    alert_rate_target = 0.01
+elif scenario == "Regulatory audit mode":
+    recall_target = 0.95
+    alert_rate_target = 0.05
 
 # ============================================================
 # DATA FUNCTIONS
@@ -132,13 +107,10 @@ alert_rate_target = st.sidebar.slider(
 @st.cache_data(show_spinner=True)
 def load_data(file, max_rows):
     df = pd.read_csv(file)
-
     if "Class" not in df.columns:
         raise ValueError("Dataset must contain a target column named 'Class'.")
-
-    if max_rows is not None and len(df) > max_rows:
+    if len(df) > max_rows:
         df = df.sample(n=max_rows, random_state=42)
-
     return df
 
 
@@ -160,62 +132,75 @@ def add_sids_proxy_features(df):
     return df
 
 # ============================================================
-# MODEL TRAINING
+# MODEL FUNCTIONS
 # ============================================================
 
 @st.cache_resource(show_spinner=True)
-def train_model(df, test_size):
+def train_models(df, test_size):
     df = add_sids_proxy_features(df)
-
     X = df.drop(columns=["Class"])
     y = df["Class"].astype(int)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        stratify=y,
-        random_state=42,
+        X, y, test_size=test_size, stratify=y, random_state=42
     )
 
-    model = Pipeline(
-        steps=[
+    models = {
+        "Logistic Regression": Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            (
-                "model",
-                LogisticRegression(
-                    class_weight="balanced",
-                    max_iter=500,
-                    solver="liblinear",
-                    random_state=42,
-                ),
-            ),
-        ]
-    )
+            ("model", LogisticRegression(
+                class_weight="balanced",
+                max_iter=500,
+                solver="liblinear",
+                random_state=42,
+            )),
+        ]),
+        "Random Forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", RandomForestClassifier(
+                n_estimators=60,
+                max_depth=7,
+                class_weight="balanced",
+                n_jobs=1,
+                random_state=42,
+            )),
+        ]),
+    }
 
-    train_start = time.time()
-    model.fit(X_train, y_train)
-    training_time = time.time() - train_start
+    trained = {}
+    score_dict = {}
+    training_times = {}
+    scoring_times = {}
 
-    score_start = time.time()
-    y_scores = model.predict_proba(X_test)[:, 1]
-    scoring_time = time.time() - score_start
+    for name, model in models.items():
+        start = time.time()
+        model.fit(X_train, y_train)
+        training_times[name] = time.time() - start
 
-    return model, X_test, y_test, y_scores, training_time, scoring_time
+        start = time.time()
+        score_dict[name] = model.predict_proba(X_test)[:, 1]
+        scoring_times[name] = time.time() - start
+        trained[name] = model
+
+    return trained, X_test, y_test, score_dict, training_times, scoring_times
 
 # ============================================================
-# METRIC FUNCTIONS
+# METRICS
 # ============================================================
 
-def compute_metrics(y_true, y_scores, threshold, latency_per_explanation_ms):
+def safe_confusion_matrix(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    return int(tn), int(fp), int(fn), int(tp)
+
+
+def compute_metrics(y_true, y_scores, threshold, latency_per_alert_ms):
     y_pred = (y_scores >= threshold).astype(int)
-
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    tn, fp, fn, tp = safe_confusion_matrix(y_true, y_pred)
     alert_volume = int(y_pred.sum())
     alert_rate = float(y_pred.mean())
-
-    total_explanation_latency_sec = (alert_volume * latency_per_explanation_ms) / 1000
+    total_latency_sec = (alert_volume * latency_per_alert_ms) / 1000
 
     return {
         "threshold": float(threshold),
@@ -224,78 +209,106 @@ def compute_metrics(y_true, y_scores, threshold, latency_per_explanation_ms):
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "true_negatives": int(tn),
-        "false_positives": int(fp),
-        "false_negatives": int(fn),
-        "true_positives": int(tp),
+        "true_negatives": tn,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "true_positives": tp,
         "alert_volume": alert_volume,
         "alert_rate": alert_rate,
-        "total_explanation_latency_sec": float(total_explanation_latency_sec),
-        "latency_per_explanation_ms": int(latency_per_explanation_ms),
+        "total_explanation_latency_sec": float(total_latency_sec),
     }
 
 
-def threshold_for_recall(y_true, y_scores, recall_target):
-    thresholds = np.unique(np.quantile(y_scores, np.linspace(0, 1, 300)))
-    candidates = []
-
-    for t in thresholds:
-        y_pred = (y_scores >= t).astype(int)
-        rec = recall_score(y_true, y_pred, zero_division=0)
-        if rec >= recall_target:
-            candidates.append((t, y_pred.sum()))
-
-    if not candidates:
-        return 0.5
-
-    return float(sorted(candidates, key=lambda x: x[1])[0][0])
-
-
-def threshold_for_alert_rate(y_scores, alert_rate_target):
-    return float(np.quantile(y_scores, 1 - alert_rate_target))
-
-
-def make_tradeoff_df(y_true, y_scores, latency_per_explanation_ms):
-    thresholds = np.unique(np.quantile(y_scores, np.linspace(0, 1, 120)))
-    rows = []
-
-    for t in thresholds:
-        rows.append(compute_metrics(y_true, y_scores, t, latency_per_explanation_ms))
-
+def make_tradeoff_df(y_true, y_scores, latency_per_alert_ms):
+    thresholds = np.unique(np.quantile(y_scores, np.linspace(0, 1, 140)))
+    rows = [compute_metrics(y_true, y_scores, t, latency_per_alert_ms) for t in thresholds]
     return pd.DataFrame(rows)
 
+
+def recommend_thresholds(tradeoff_df, recall_target, alert_rate_target, latency_target_sec):
+    recommendations = {}
+
+    # Best F1 threshold
+    if len(tradeoff_df) > 0:
+        recommendations["Best F1"] = tradeoff_df.loc[tradeoff_df["f1"].idxmax()].to_dict()
+
+    # Recall-constrained: meet recall with lowest alert volume
+    recall_df = tradeoff_df[tradeoff_df["recall"] >= recall_target]
+    if len(recall_df) > 0:
+        recommendations["Recall-based"] = recall_df.sort_values("alert_volume").iloc[0].to_dict()
+
+    # Alert-volume-constrained: meet alert rate with highest recall
+    alert_df = tradeoff_df[tradeoff_df["alert_rate"] <= alert_rate_target]
+    if len(alert_df) > 0:
+        recommendations["Alert-volume-based"] = alert_df.sort_values("recall", ascending=False).iloc[0].to_dict()
+
+    # Full feasibility envelope: recall + alert + latency
+    feasible_df = tradeoff_df[
+        (tradeoff_df["recall"] >= recall_target)
+        & (tradeoff_df["alert_rate"] <= alert_rate_target)
+        & (tradeoff_df["total_explanation_latency_sec"] <= latency_target_sec)
+    ]
+    if len(feasible_df) > 0:
+        recommendations["Feasibility Envelope"] = feasible_df.sort_values(["f1", "precision"], ascending=False).iloc[0].to_dict()
+
+    return recommendations
+
 # ============================================================
-# EXPLANATION FUNCTION
+# EXPLANATION VIEW
 # ============================================================
 
-def generate_simple_explanation(model, X_test, transaction_position):
+def generate_explanation(model, X_test, transaction_position):
+    """Lightweight feature-contribution view.
+    For Logistic Regression: coefficient × transformed value.
+    For Random Forest: feature importance × raw absolute value, as a demonstration proxy.
     """
-    Lightweight explanation for presentation.
-    For Logistic Regression, this approximates feature contribution as:
-    scaled_feature_value × coefficient.
-    """
-
-    preprocessor = model[:-1]
-    classifier = model.named_steps["model"]
-
     X_row = X_test.iloc[[transaction_position]]
-    transformed = preprocessor.transform(X_row)
+    final_model = model.named_steps["model"]
 
-    coefs = classifier.coef_[0]
-    contributions = transformed[0] * coefs
+    if isinstance(final_model, LogisticRegression):
+        preprocessor = model[:-1]
+        transformed = preprocessor.transform(X_row)
+        coefs = final_model.coef_[0]
+        contributions = transformed[0] * coefs
+    elif isinstance(final_model, RandomForestClassifier):
+        importances = final_model.feature_importances_
+        raw_values = X_row.iloc[0].fillna(0).values
+        contributions = importances * np.abs(raw_values)
+    else:
+        contributions = np.zeros(len(X_test.columns))
 
-    explanation_df = pd.DataFrame(
-        {
-            "feature": X_test.columns,
-            "contribution": contributions,
-            "absolute_contribution": np.abs(contributions),
-            "original_value": X_row.iloc[0].values,
-        }
-    )
+    explanation_df = pd.DataFrame({
+        "feature": X_test.columns,
+        "original_value": X_row.iloc[0].values,
+        "contribution": contributions,
+        "absolute_contribution": np.abs(contributions),
+    })
 
-    explanation_df = explanation_df.sort_values("absolute_contribution", ascending=False).head(10)
+    return explanation_df.sort_values("absolute_contribution", ascending=False).head(10)
 
-    return explanation_df[["feature", "original_value", "contribution"]]
+# ============================================================
+# REPORT EXPORT
+# ============================================================
+
+def create_text_report(dataset_summary, selected_model, current_metrics, recommendations):
+    lines = []
+    lines.append("SIDS Governance Feasibility Report")
+    lines.append("=" * 45)
+    lines.append("")
+    lines.append("Dataset Summary")
+    lines.append(json.dumps(dataset_summary, indent=2))
+    lines.append("")
+    lines.append(f"Selected Model: {selected_model}")
+    lines.append("")
+    lines.append("Current Threshold Metrics")
+    lines.append(json.dumps(current_metrics, indent=2))
+    lines.append("")
+    lines.append("Recommended Operating Points")
+    lines.append(json.dumps(recommendations, indent=2))
+    lines.append("")
+    lines.append("Governance Interpretation")
+    lines.append("The threshold governs how model scores become operational decisions. Feasibility depends on recall, alert volume, explanation latency, and analyst workload.")
+    return "\n".join(lines)
 
 # ============================================================
 # MAIN APP
@@ -323,27 +336,51 @@ c2.metric("Fraud cases", f"{fraud_count:,}")
 c3.metric("Fraud rate", f"{fraud_rate:.4%}")
 c4.metric("Missing values", f"{int(df.isnull().sum().sum()):,}")
 
-with st.spinner("Training lightweight model and scoring transactions..."):
-    model, X_test, y_test, y_scores, training_time, scoring_time = train_model(df, test_size)
+dataset_summary = {
+    "transactions": total_count,
+    "fraud_cases": fraud_count,
+    "legitimate_cases": total_count - fraud_count,
+    "fraud_rate": fraud_rate,
+    "missing_values": int(df.isnull().sum().sum()),
+    "duplicate_rows": int(df.duplicated().sum()),
+}
 
-# Auto-play threshold logic
+with st.spinner("Training models and scoring transactions..."):
+    models, X_test, y_test, score_dict, training_times, scoring_times = train_models(df, test_size)
+
+st.subheader("2. Model Comparison")
+
+comparison_rows = []
+for model_name, scores in score_dict.items():
+    m = compute_metrics(y_test, scores, threshold, latency_per_alert_ms)
+    comparison_rows.append({
+        "model": model_name,
+        "AUC-PR": m["auc_pr"],
+        "ROC-AUC": m["roc_auc"],
+        "Recall": m["recall"],
+        "Precision": m["precision"],
+        "F1": m["f1"],
+        "Alerts": m["alert_volume"],
+        "Training sec": training_times[model_name],
+        "Scoring sec": scoring_times[model_name],
+    })
+
+comparison_df = pd.DataFrame(comparison_rows)
+st.dataframe(comparison_df, use_container_width=True)
+
+selected_model = st.selectbox("Select model for interactive governance analysis", list(models.keys()))
+model = models[selected_model]
+y_scores = score_dict[selected_model]
+
 if auto_play:
-    t = (time.time() * auto_speed) % 1.0
-    threshold = float(t)
-else:
-    threshold = manual_threshold
+    threshold = float((time.time() * auto_speed) % 1.0)
 
-st.subheader("2. Model Status")
-
-m1, m2, m3 = st.columns(3)
-m1.metric("Training time", f"{training_time:.3f} sec")
-m2.metric("Scoring time", f"{scoring_time:.4f} sec")
-m3.metric("Test transactions", f"{len(y_test):,}")
-
-metrics = compute_metrics(y_test, y_scores, threshold, latency_per_explanation_ms)
+metrics = compute_metrics(y_test, y_scores, threshold, latency_per_alert_ms)
+tradeoff_df = make_tradeoff_df(y_test, y_scores, latency_per_alert_ms)
+recommendations = recommend_thresholds(tradeoff_df, recall_target, alert_rate_target, latency_target_sec)
 
 st.subheader("3. Live Threshold Impact")
-st.caption(f"Current threshold: {threshold:.4f}")
+st.caption(f"Selected model: {selected_model} | Current threshold: {threshold:.4f}")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Recall", f"{metrics['recall']:.3f}")
@@ -354,10 +391,10 @@ k4.metric("Alert Rate", f"{metrics['alert_rate']:.2%}")
 k5, k6, k7, k8 = st.columns(4)
 k5.metric("AUC-PR", f"{metrics['auc_pr']:.3f}")
 k6.metric("ROC-AUC", f"{metrics['roc_auc']:.3f}")
-k7.metric("F1-score", f"{metrics['f1']:.3f}")
-k8.metric("Total explanation latency", f"{metrics['total_explanation_latency_sec']:.2f} sec")
+k7.metric("F1", f"{metrics['f1']:.3f}")
+k8.metric("Explanation Latency", f"{metrics['total_explanation_latency_sec']:.2f} sec")
 
-st.markdown("### Confusion Matrix at Selected Threshold")
+st.markdown("### Confusion Matrix")
 cm_df = pd.DataFrame(
     {
         "Predicted Legitimate": [metrics["true_negatives"], metrics["false_negatives"]],
@@ -367,147 +404,150 @@ cm_df = pd.DataFrame(
 )
 st.dataframe(cm_df, use_container_width=True)
 
-# Governance operating modes
-st.subheader("4. Governance Operating Modes")
+st.subheader("4. Governance Status Panel")
 
-recall_threshold = threshold_for_recall(y_test, y_scores, recall_target)
-alert_threshold = threshold_for_alert_rate(y_scores, alert_rate_target)
+recall_pass = metrics["recall"] >= recall_target
+alert_pass = metrics["alert_rate"] <= alert_rate_target
+latency_pass = metrics["total_explanation_latency_sec"] <= latency_target_sec
 
-recall_metrics = compute_metrics(y_test, y_scores, recall_threshold, latency_per_explanation_ms)
-alert_metrics = compute_metrics(y_test, y_scores, alert_threshold, latency_per_explanation_ms)
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Recall Target", "PASS" if recall_pass else "FAIL", f"{metrics['recall']:.3f} / {recall_target:.2f}")
+s2.metric("Alert-Rate Target", "PASS" if alert_pass else "FAIL", f"{metrics['alert_rate']:.2%} / {alert_rate_target:.2%}")
+s3.metric("Latency Target", "PASS" if latency_pass else "FAIL", f"{metrics['total_explanation_latency_sec']:.2f}s / {latency_target_sec:.0f}s")
+s4.metric("Deployment Status", "FEASIBLE" if recall_pass and alert_pass and latency_pass else "NOT FEASIBLE")
 
-col_a, col_b = st.columns(2)
+if recall_pass and alert_pass and latency_pass:
+    st.success("Inside SIDS feasibility envelope ✅")
+elif recall_pass and not alert_pass:
+    st.warning("Recall is acceptable, but alert workload is too high.")
+elif alert_pass and not recall_pass:
+    st.warning("Workload is controlled, but recall is below risk target.")
+else:
+    st.error("Outside feasibility envelope ❌")
 
-with col_a:
-    st.markdown("### Recall-Based Mode")
-    st.caption("Risk-control mode: catch at least the target proportion of fraud.")
-    st.metric("Selected threshold", f"{recall_threshold:.4f}")
-    st.metric("Recall", f"{recall_metrics['recall']:.3f}")
-    st.metric("Alert volume", f"{recall_metrics['alert_volume']:,}")
-    st.metric("False negatives", f"{recall_metrics['false_negatives']:,}")
-    st.metric("Estimated explanation time", f"{recall_metrics['total_explanation_latency_sec']:.2f} sec")
+st.subheader("5. Threshold Recommendation Engine")
 
-with col_b:
-    st.markdown("### Alert-Volume Mode")
-    st.caption("Operational-control mode: limit alerts to analyst capacity.")
-    st.metric("Selected threshold", f"{alert_threshold:.4f}")
-    st.metric("Recall", f"{alert_metrics['recall']:.3f}")
-    st.metric("Alert volume", f"{alert_metrics['alert_volume']:,}")
-    st.metric("False negatives", f"{alert_metrics['false_negatives']:,}")
-    st.metric("Estimated explanation time", f"{alert_metrics['total_explanation_latency_sec']:.2f} sec")
+if recommendations:
+    rec_table = pd.DataFrame(recommendations).T
+    display_cols = ["threshold", "recall", "precision", "f1", "alert_volume", "alert_rate", "total_explanation_latency_sec"]
+    st.dataframe(rec_table[display_cols], use_container_width=True)
+else:
+    st.warning("No recommended threshold found under current constraints.")
 
-# Trade-off curves
-st.subheader("5. Trade-Off Curves")
+selected_recommendation = st.selectbox("Inspect recommended operating point", list(recommendations.keys()) if recommendations else ["None"])
+if selected_recommendation != "None" and recommendations:
+    st.json(recommendations[selected_recommendation])
 
-tradeoff_df = make_tradeoff_df(y_test, y_scores, latency_per_explanation_ms)
+st.subheader("6. Analyst Workload Simulation")
 
-fig1, ax1 = plt.subplots(figsize=(8, 4))
-ax1.plot(tradeoff_df["alert_volume"], tradeoff_df["recall"])
-ax1.scatter([recall_metrics["alert_volume"]], [recall_metrics["recall"]], label="Recall mode")
-ax1.scatter([alert_metrics["alert_volume"]], [alert_metrics["recall"]], label="Alert-volume mode")
-ax1.set_xlabel("Alert Volume")
-ax1.set_ylabel("Recall")
-ax1.set_title("Recall vs Alert Volume")
-ax1.legend()
-ax1.grid(True)
-st.pyplot(fig1)
+total_review_minutes = metrics["alert_volume"] * review_time_per_alert_min
+analysts_needed = total_review_minutes / 480
 
-fig2, ax2 = plt.subplots(figsize=(8, 4))
-ax2.plot(tradeoff_df["threshold"], tradeoff_df["alert_volume"])
-ax2.set_xlabel("Threshold")
-ax2.set_ylabel("Alert Volume")
-ax2.set_title("Threshold vs Alert Volume")
-ax2.grid(True)
-st.pyplot(fig2)
+w1, w2, w3 = st.columns(3)
+w1.metric("Alerts", f"{metrics['alert_volume']:,}")
+w2.metric("Total review time", f"{total_review_minutes:.0f} min")
+w3.metric("Analysts required / 8h shift", f"{analysts_needed:.2f}")
 
-fig3, ax3 = plt.subplots(figsize=(8, 4))
+st.subheader("7. Trade-Off Curves")
+
+g1, g2 = st.columns(2)
+
+with g1:
+    fig1, ax1 = plt.subplots(figsize=(7, 4))
+    ax1.plot(tradeoff_df["alert_volume"], tradeoff_df["recall"])
+    ax1.scatter(metrics["alert_volume"], metrics["recall"], label="Current threshold")
+    ax1.set_xlabel("Alert Volume")
+    ax1.set_ylabel("Recall")
+    ax1.set_title("Recall vs Alert Volume")
+    ax1.legend()
+    ax1.grid(True)
+    st.pyplot(fig1)
+
+with g2:
+    fig2, ax2 = plt.subplots(figsize=(7, 4))
+    ax2.plot(tradeoff_df["threshold"], tradeoff_df["alert_volume"])
+    ax2.scatter(metrics["threshold"], metrics["alert_volume"], label="Current threshold")
+    ax2.set_xlabel("Threshold")
+    ax2.set_ylabel("Alert Volume")
+    ax2.set_title("Threshold vs Alert Volume")
+    ax2.legend()
+    ax2.grid(True)
+    st.pyplot(fig2)
+
+fig3, ax3 = plt.subplots(figsize=(9, 4))
 ax3.plot(tradeoff_df["threshold"], tradeoff_df["recall"], label="Recall")
 ax3.plot(tradeoff_df["threshold"], tradeoff_df["precision"], label="Precision")
+ax3.plot(tradeoff_df["threshold"], tradeoff_df["f1"], label="F1")
+ax3.scatter(metrics["threshold"], metrics["recall"], label="Current recall")
 ax3.set_xlabel("Threshold")
-ax3.set_ylabel("Score")
-ax3.set_title("Threshold vs Recall and Precision")
+ax3.set_ylabel("Metric value")
+ax3.set_title("Threshold vs Recall, Precision and F1")
 ax3.legend()
 ax3.grid(True)
 st.pyplot(fig3)
 
-# Explanation latency governance
-st.subheader("6. Explanation Latency Governance")
+st.subheader("8. Transaction-Level Explanation View")
+
+ranked_indices = np.argsort(y_scores)[::-1]
+selected_rank = st.slider("Select transaction by risk rank", 1, min(100, len(ranked_indices)), 1, 1)
+tx_pos = int(ranked_indices[selected_rank - 1])
+tx_score = float(y_scores[tx_pos])
+tx_decision = int(tx_score >= threshold)
 
 st.markdown(
     f"""
-Assumed latency per explanation: **{latency_per_explanation_ms} ms**  
-Current selected threshold produces **{metrics['alert_volume']:,} alerts**.  
-Estimated total explanation time: **{metrics['total_explanation_latency_sec']:.2f} seconds**.
-
-This shows that explanation latency depends not only on the explainer, but also on alert volume.
+**Risk rank:** {selected_rank}  
+**Fraud probability:** {tx_score:.4f}  
+**Current decision:** {'Fraud Alert' if tx_decision == 1 else 'Not Alerted'}
 """
 )
 
-# Transaction explanation view
-st.subheader("7. Transaction-Level Explanation View")
+explanation_df = generate_explanation(model, X_test, tx_pos)
+st.dataframe(explanation_df[["feature", "original_value", "contribution"]], use_container_width=True)
 
-if len(y_scores) > 0:
-    ranked_indices = np.argsort(y_scores)[::-1]
-    selected_rank = st.slider(
-        "Select transaction by risk rank",
-        min_value=1,
-        max_value=min(100, len(ranked_indices)),
-        value=1,
-        step=1,
-    )
+fig4, ax4 = plt.subplots(figsize=(8, 4))
+plot_df = explanation_df.sort_values("contribution")
+ax4.barh(plot_df["feature"], plot_df["contribution"])
+ax4.set_xlabel("Approximate feature contribution")
+ax4.set_title("Top Feature Contributions")
+ax4.grid(True)
+st.pyplot(fig4)
 
-    tx_pos = int(ranked_indices[selected_rank - 1])
-    tx_score = float(y_scores[tx_pos])
-    tx_prediction = int(tx_score >= threshold)
-
-    st.markdown(
-        f"""
-**Selected transaction risk rank:** {selected_rank}  
-**Fraud probability:** {tx_score:.4f}  
-**Current decision:** {'Fraud Alert' if tx_prediction == 1 else 'Not Alerted'}
-"""
-    )
-
-    explanation_df = generate_simple_explanation(model, X_test, tx_pos)
-    st.dataframe(explanation_df, use_container_width=True)
-
-    fig4, ax4 = plt.subplots(figsize=(8, 4))
-    plot_df = explanation_df.sort_values("contribution")
-    ax4.barh(plot_df["feature"], plot_df["contribution"])
-    ax4.set_xlabel("Approximate contribution")
-    ax4.set_title("Top Feature Contributions for Selected Transaction")
-    ax4.grid(True)
-    st.pyplot(fig4)
-
-# Governance interpretation
-st.subheader("8. Governance Interpretation")
-
-if metrics["recall"] >= recall_target and metrics["alert_rate"] <= alert_rate_target:
-    st.success("This threshold satisfies both recall and alert-volume constraints.")
-elif metrics["recall"] >= recall_target:
-    st.warning("This threshold satisfies recall, but alert volume may be operationally high.")
-elif metrics["alert_rate"] <= alert_rate_target:
-    st.warning("This threshold controls workload, but recall may be below the risk target.")
-else:
-    st.error("This threshold satisfies neither the recall target nor the alert-volume target.")
+st.subheader("9. Governance Interpretation")
 
 st.markdown(
     """
-### Defence line
-**The model does not define deployment behaviour by itself. The threshold governs how model scores become operational decisions.**
+**Defence line:** The model does not define deployment behaviour by itself. The threshold governs operational outcomes under real-world constraints.
+
+This dashboard therefore operationalises explainability and threshold selection as a **governance mechanism**, not merely a technical tuning exercise.
 """
 )
 
-# Export outputs
-st.subheader("9. Export Results")
+st.subheader("10. Export Regulator-Ready Outputs")
 
-export_df = tradeoff_df.copy()
-export_df["selected_manual_threshold"] = threshold
+report_text = create_text_report(dataset_summary, selected_model, metrics, recommendations)
 
-csv = export_df.to_csv(index=False).encode("utf-8")
 st.download_button(
-    label="Download threshold trade-off CSV",
+    label="Download governance report (.txt)",
+    data=report_text.encode("utf-8"),
+    file_name="sids_governance_feasibility_report.txt",
+    mime="text/plain",
+)
+
+csv = tradeoff_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download threshold trade-off table (.csv)",
     data=csv,
-    file_name="threshold_tradeoff_dashboard.csv",
+    file_name="threshold_tradeoff_table.csv",
     mime="text/csv",
 )
+
+comparison_csv = comparison_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download model comparison table (.csv)",
+    data=comparison_csv,
+    file_name="model_comparison_table.csv",
+    mime="text/csv",
+)
+
+st.info("For formal PDF reports, export the text report and convert it to PDF, or extend this app with reportlab.")
